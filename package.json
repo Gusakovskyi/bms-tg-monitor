@@ -1,0 +1,17 @@
+{
+  "name": "bms-telegram-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monitors BMS /bsync and sends Telegram notifications",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": "18.x"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3"
+  }
+}
