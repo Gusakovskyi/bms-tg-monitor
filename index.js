@@ -4,19 +4,17 @@ require("dotenv").config();
 /**
  * BMS Monitor -> Telegram notifier
  *
- * - Polls /bsync every N seconds (default 10s) using multipart form r00=99
- * - Sends Telegram notifications (group supported via TELEGRAM_CHAT_ID)
- * - Notifies:
- *   - Charge started (Bat_Watt > deadband)
- *   - Discharge started (Bat_Watt < -deadband)
- *   - Each 10% boundary crossed up/down while charging/discharging
- * - Endpoint failover:
- *   - If current port fails, tries ports 1010/1030/1040 (configurable)
- *   - Remembers new port in memory (until process restart)
- * - Sends "endpoint unreachable" only after 5 minutes of consecutive failures
- * - More logs: logs every successful poll + detailed failure streak logs
+ * Key fix for "STARTED spam":
+ * - Hysteresis:
+ *    - Enter charge if W >= ENTER_WATT
+ *    - Leave charge -> idle if W < EXIT_WATT
+ *    - Enter discharge if W <= -ENTER_WATT
+ *    - Leave discharge -> idle if W > -EXIT_WATT
+ * - Debounce:
+ *    - Require STABLE_POLLS consecutive polls of the next mode before switching
  *
- * Notifications and code comments are in English as requested.
+ * Telegram formatting:
+ * - Uses HTML parse_mode + <blockquote> for metrics details (quote style).
  */
 
 const HOST = process.env.BMS_HOST || "178.212.196.134";
@@ -31,40 +29,47 @@ const FALLBACK_PORTS = (process.env.BMS_FALLBACK_PORTS || "1010,1030,1040")
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 10_000);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 4_000);
 
-// Deadband to prevent flapping around 0W
-const WATT_DEADBAND = Number(process.env.WATT_DEADBAND || 5);
+// --- MODE DETECTION (your request: 50W threshold) ---
+const ENTER_WATT = Number(process.env.ENTER_WATT || 50); // enter charge/discharge
+const EXIT_WATT = Number(process.env.EXIT_WATT || 30);   // exit to idle (hysteresis)
+const STABLE_POLLS = Number(process.env.STABLE_POLLS || 3);
 
 // Send "unreachable" alert only after N ms of consecutive failures
 const DOWN_ALERT_AFTER_MS = Number(process.env.DOWN_ALERT_AFTER_MS || 30 * 60 * 1000);
 
-// Logging
-const LOG_EVERY_POLL = (process.env.LOG_EVERY_POLL ?? "1") !== "0"; // default ON
+// --- LOGGING ---
+const LOG_EVERY_POLL = (process.env.LOG_EVERY_POLL ?? "1") !== "0";
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase(); // debug|info|warn|error
 
-// Telegram config
+// --- TELEGRAM ---
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 // --- runtime state ---
 let currentPort = DEFAULT_PORT;
 
-let lastMode = "unknown"; // charge | discharge | idle | unknown
-let lastLevel = null; // integer 0..100
+// committed (stable) mode:
+let mode = "unknown"; // charge | discharge | idle | unknown
+let lastLevel = null; // 0..100
 
-// Boundaries notified within the current charge/discharge session
+// debounce candidate state:
+let candidateMode = "unknown";
+let candidateCount = 0;
+
+// boundaries notified within current charge/discharge session
 let sessionNotified = new Set();
 
-// Failure streak state
+// failure streak
 let consecutiveFailures = 0;
-let firstFailureAt = null; // ms timestamp when the current failure streak started
+let firstFailureAt = null;
 let downAlertSent = false;
-
-function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
-}
 
 function nowMs() {
     return Date.now();
+}
+
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
 }
 
 function fmtMs(ms) {
@@ -89,24 +94,23 @@ function log(level, ...args) {
     console.log(prefix, ...args);
 }
 
-function buildUrl(port) {
-    return `http://${HOST}:${port}${PATH}`;
+function toNumber(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
 }
 
 function clamp(n, min, max) {
     return Math.max(min, Math.min(max, n));
 }
 
-function toNumber(v) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+function buildUrl(port) {
+    return `http://${HOST}:${port}${PATH}`;
 }
 
-/**
- * Compute battery level in %.
- * Prefer BMS-provided Batt_SOC if present.
- * Otherwise compute from remaining Ah / total Ah.
- */
+function resetSession() {
+    sessionNotified = new Set();
+}
+
 function computeLevel(stats) {
     const lvl = toNumber(stats.Batt_SOC);
     if (lvl !== null) return clamp(Math.round(lvl), 0, 100);
@@ -116,24 +120,9 @@ function computeLevel(stats) {
     if (rcap !== null && cap !== null && cap > 0) {
         return clamp(Math.round((rcap / cap) * 100), 0, 100);
     }
-
     return null;
 }
 
-/**
- * Detect current mode based on Bat_Watt.
- * Positive => charge, negative => discharge, near 0 => idle.
- */
-function detectMode(batWatt) {
-    if (batWatt === null) return "unknown";
-    if (batWatt > WATT_DEADBAND) return "charge";
-    if (batWatt < -WATT_DEADBAND) return "discharge";
-    return "idle";
-}
-
-/**
- * Get minimal cell voltage from keys "1".."Cel_Coun".
- */
 function getMinCellVoltage(stats) {
     const n = Number(stats.Cel_Coun || 0);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -147,61 +136,115 @@ function getMinCellVoltage(stats) {
 }
 
 /**
- * Format a compact metrics line (power/current/voltage/deltaV/minCell).
+ * Hysteresis-based next mode proposal.
+ * Uses the current committed mode to decide when to leave it.
  */
-function fmtMetricsLine(stats) {
-    const v = toNumber(stats.Bat_TVol);
-    const a = toNumber(stats.Bat_CurD);
-    const w = toNumber(stats.Bat_Watt);
-    const dv = toNumber(stats.Cel_DifV);
-    const minCell = getMinCellVoltage(stats);
+function proposeNextMode(currentMode, watt) {
+    if (watt === null) return "unknown";
 
-    const parts = [];
-    if (w !== null) parts.push(`P ${w >= 0 ? "+" : ""}${w.toFixed(0)} W`);
-    if (a !== null) parts.push(`I ${a >= 0 ? "+" : ""}${a.toFixed(1)} A`);
-    if (v !== null) parts.push(`V ${v.toFixed(2)} V`);
-    if (dv !== null) parts.push(`ΔV ${dv.toFixed(3)} V`);
-    if (minCell !== null) parts.push(`Min ${minCell.toFixed(3)} V`);
+    if (currentMode === "charge") {
+        // stay charging unless we fall below EXIT_WATT
+        return watt < EXIT_WATT ? "idle" : "charge";
+    }
+    if (currentMode === "discharge") {
+        // stay discharging unless we rise above -EXIT_WATT
+        return watt > -EXIT_WATT ? "idle" : "discharge";
+    }
 
-    return parts.join(" • ");
+    // if idle/unknown: decide whether to enter charge/discharge
+    if (watt >= ENTER_WATT) return "charge";
+    if (watt <= -ENTER_WATT) return "discharge";
+    return "idle";
 }
 
 /**
- * "Level 81% (226.8 / 280.0 Ah)"
+ * Debounce mode switching: require STABLE_POLLS in a row.
  */
-function fmtLevelLine(stats, level) {
+function debounceMode(nextMode) {
+    if (nextMode === candidateMode) {
+        candidateCount += 1;
+    } else {
+        candidateMode = nextMode;
+        candidateCount = 1;
+    }
+
+    // only commit switch if stable enough AND different from current mode
+    if (candidateCount >= STABLE_POLLS && candidateMode !== mode) {
+        const prev = mode;
+        mode = candidateMode;
+        candidateCount = 0; // reset (optional)
+        return { changed: true, prev, current: mode };
+    }
+
+    return { changed: false, prev: mode, current: mode };
+}
+
+// --- Telegram HTML formatting (quote block) ---
+function esc(s) {
+    return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+}
+
+function fmtSigned(n, digits) {
+    if (!Number.isFinite(n)) return "?";
+    const sign = n >= 0 ? "+" : "";
+    return `${sign}${n.toFixed(digits)}`;
+}
+
+function buildQuoteLines(stats) {
+    const w = toNumber(stats.Bat_Watt);
+    const a = toNumber(stats.Bat_CurD);
+    const v = toNumber(stats.Bat_TVol);
+    const dv = toNumber(stats.Cel_DifV);
+    const minCell = getMinCellVoltage(stats);
+
+    return [
+        `${w !== null ? fmtSigned(w, 0) : "?"} W`,
+        `${a !== null ? fmtSigned(a, 1) : "?"} A`,
+        `${v !== null ? v.toFixed(2) : "?"} V`,
+        `Δ${dv !== null ? dv.toFixed(3) : "?"} V`,
+        `Min ${minCell !== null ? minCell.toFixed(3) : "?"} V`,
+    ];
+}
+
+function msgModeStarted(currentMode, stats, level) {
+    const isCharge = currentMode === "charge";
+    const emoji = isCharge ? "⚡" : "🔋";
+    const title = isCharge ? "CHARGING" : "DISCHARGING";
+
     const rcap = toNumber(stats.Bat_RCap);
     const cap = toNumber(stats.Batt_Cap);
 
-    const levelPart = level !== null ? `Level ${level}%` : `Level ?%`;
-    const capPart =
-        rcap !== null && cap !== null ? `(${rcap.toFixed(1)} / ${cap.toFixed(1)} Ah)` : "";
+    const line1 = `${emoji} <b>${title}</b>`;
+    const line2 =
+        level !== null && rcap !== null && cap !== null
+            ? `<b>${esc(level)}%</b> (${esc(rcap.toFixed(1))} / ${esc(cap.toFixed(1))} Ah)`
+            : `<b>Level</b>: ${esc(level ?? "?")}%`;
 
-    return `${levelPart}  ${capPart}`.trim();
+    const quote = buildQuoteLines(stats).map(esc).join("\n");
+    return `${line1}\n${line2}\n\n<blockquote>${quote}</blockquote>`;
 }
 
-function fmtTimeLine(stats) {
-    return `🕒 ${stats.datetime || new Date().toISOString()}`;
-}
-
-function msgStart(mode, stats, level) {
-    const title = mode === "charge" ? "⚡ CHARGE STARTED" : "🔋 DISCHARGE STARTED";
-    return [title, fmtLevelLine(stats, level), fmtMetricsLine(stats), fmtTimeLine(stats)].join("\n");
-}
-
-function msgThreshold(dir, boundary, stats, level) {
-    // dir: "down" | "up"
-    const title = dir === "down" ? `📉 LEVEL ↓ ${boundary}%` : `📈 LEVEL ↑ ${boundary}%`;
+function msgLevelBoundary(dir, boundary, stats, level) {
+    const emoji = dir === "down" ? "📉" : "📈";
+    const arrow = dir === "down" ? "↓" : "↑";
 
     const rcap = toNumber(stats.Bat_RCap);
     const cap = toNumber(stats.Batt_Cap);
-    const capLine =
-        rcap !== null && cap !== null ? `${rcap.toFixed(1)} / ${cap.toFixed(1)} Ah` : fmtLevelLine(stats, level);
 
-    return [title, capLine, fmtMetricsLine(stats), fmtTimeLine(stats)].join("\n");
+    const line1 = `${emoji} <b>LEVEL ${arrow} ${boundary}%</b>`;
+    const line2 =
+        level !== null && rcap !== null && cap !== null
+            ? `<b>${esc(level)}%</b> (${esc(rcap.toFixed(1))} / ${esc(cap.toFixed(1))} Ah)`
+            : `<b>Level</b>: ${esc(level ?? "?")}%`;
+
+    const quote = buildQuoteLines(stats).map(esc).join("\n");
+    return `${line1}\n${line2}\n\n<blockquote>${quote}</blockquote>`;
 }
 
-async function sendTelegram(text) {
+async function sendTelegram(htmlText) {
     if (!TG_TOKEN || !TG_CHAT_ID) {
         log("warn", "Telegram config missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.");
         return;
@@ -209,8 +252,9 @@ async function sendTelegram(text) {
 
     const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
     const body = {
-        chat_id: TG_CHAT_ID, // group chat_id is usually negative (-100...)
-        text,
+        chat_id: TG_CHAT_ID,
+        text: htmlText,
+        parse_mode: "HTML",
         disable_web_page_preview: true,
     };
 
@@ -226,10 +270,10 @@ async function sendTelegram(text) {
     }
 }
 
+// --- HTTP multipart POST ---
 async function fetchWithTimeout(url, opts, timeoutMs) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
-
     try {
         return await fetch(url, { ...opts, signal: controller.signal });
     } finally {
@@ -238,7 +282,6 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
 }
 
 function makeMultipartBody(fields) {
-    // Minimal multipart/form-data builder (no external deps)
     const boundary = "----bmsBoundary" + Math.random().toString(16).slice(2);
     const chunks = [];
 
@@ -271,10 +314,7 @@ async function tryFetchStatsOnPort(port) {
         REQUEST_TIMEOUT_MS
     );
 
-    if (!res.ok) {
-        throw new Error(`HTTP ${res.status} on ${url}`);
-    }
-
+    if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
     return await res.json();
 }
 
@@ -289,8 +329,7 @@ async function fetchStatsWithPortFailover() {
             if (p !== currentPort) {
                 const old = currentPort;
                 currentPort = p;
-                // Inform about port switch
-                await sendTelegram(`✅ BMS endpoint recovered. Switched port from ${old} to ${p}.`);
+                await sendTelegram(`✅ <b>BMS recovered.</b>\nSwitched port ${old} → ${p}`);
                 log("info", `Port switched: ${old} -> ${p}`);
             }
 
@@ -304,60 +343,51 @@ async function fetchStatsWithPortFailover() {
     throw lastErr || new Error("All ports failed");
 }
 
-function resetSession() {
-    sessionNotified = new Set();
-}
-
 async function handleCycle(stats) {
     const level = computeLevel(stats);
-    const batWatt = toNumber(stats.Bat_Watt);
-    const mode = detectMode(batWatt);
+    const watt = toNumber(stats.Bat_Watt);
 
-    // Log every successful poll (compact)
+    const proposed = proposeNextMode(mode, watt);
+    const sw = debounceMode(proposed);
+
+    // success poll logs
     if (LOG_EVERY_POLL) {
         const rcap = toNumber(stats.Bat_RCap);
         const cap = toNumber(stats.Batt_Cap);
         const dv = toNumber(stats.Cel_DifV);
         const minCell = getMinCellVoltage(stats);
+
         log(
             "info",
-            `OK port=${currentPort} mode=${mode} level=${level ?? "?"}% watt=${batWatt ?? "?"}W ` +
-            `rcap=${rcap ?? "?"}Ah cap=${cap ?? "?"}Ah ΔV=${dv ?? "?"} minCell=${minCell ?? "?"}`
+            `OK port=${currentPort} mode=${mode} proposed=${proposed} cand=${candidateMode}(${candidateCount}) ` +
+            `level=${level ?? "?"}% watt=${watt ?? "?"}W rcap=${rcap ?? "?"}Ah cap=${cap ?? "?"}Ah ΔV=${dv ?? "?"} min=${minCell ?? "?"}`
         );
     }
 
-    // Mode change notifications (only for charge/discharge start)
-    if (mode !== lastMode) {
-        if (mode === "discharge") {
+    // If mode changed (committed), notify only when entering charge/discharge
+    if (sw.changed) {
+        log("warn", `Mode changed: ${sw.prev} -> ${sw.current} (ENTER=${ENTER_WATT}W EXIT=${EXIT_WATT}W stable=${STABLE_POLLS})`);
+
+        if (sw.current === "charge" || sw.current === "discharge") {
             resetSession();
-            await sendTelegram(msgStart("discharge", stats, level));
-            log("info", "Discharging started (notified)");
-        } else if (mode === "charge") {
-            resetSession();
-            await sendTelegram(msgStart("charge", stats, level));
-            log("info", "Charging started (notified)");
-        } else {
-            log("info", `Mode changed: ${lastMode} -> ${mode}`);
+            await sendTelegram(msgModeStarted(sw.current, stats, level));
         }
-        lastMode = mode;
     }
 
-    // 10% boundaries notifications
+    // Boundaries: only while in committed charge/discharge
     if (level !== null && lastLevel !== null) {
         if (mode === "discharge") {
             for (let b = 90; b >= 0; b -= 10) {
                 if (lastLevel > b && level <= b && !sessionNotified.has(`D${b}`)) {
                     sessionNotified.add(`D${b}`);
-                    await sendTelegram(msgThreshold("down", b, stats, level));
-                    log("info", `Boundary (discharge) reached: ${b}% (notified)`);
+                    await sendTelegram(msgLevelBoundary("down", b, stats, level));
                 }
             }
         } else if (mode === "charge") {
             for (let b = 10; b <= 100; b += 10) {
                 if (lastLevel < b && level >= b && !sessionNotified.has(`C${b}`)) {
                     sessionNotified.add(`C${b}`);
-                    await sendTelegram(msgThreshold("up", b, stats, level));
-                    log("info", `Boundary (charge) reached: ${b}% (notified)`);
+                    await sendTelegram(msgLevelBoundary("up", b, stats, level));
                 }
             }
         }
@@ -375,13 +405,14 @@ async function main() {
         FALLBACK_PORTS,
         POLL_INTERVAL_MS,
         REQUEST_TIMEOUT_MS,
-        WATT_DEADBAND,
+        ENTER_WATT,
+        EXIT_WATT,
+        STABLE_POLLS,
         DOWN_ALERT_AFTER_MS,
         LOG_LEVEL,
         LOG_EVERY_POLL,
     });
 
-    // Avoid crashing on unhandled errors
     process.on("unhandledRejection", (err) => log("error", "unhandledRejection:", err));
     process.on("uncaughtException", (err) => log("error", "uncaughtException:", err));
 
@@ -396,17 +427,15 @@ async function main() {
             consecutiveFailures = 0;
             firstFailureAt = null;
 
-            // If we already sent "down" alert, notify recovery immediately
             if (downAlertSent) {
                 downAlertSent = false;
-                await sendTelegram(`✅ BMS endpoint is reachable again on port ${currentPort}.`);
+                await sendTelegram(`✅ <b>BMS endpoint</b> is reachable again on port <b>${currentPort}</b>.`);
             }
 
             await handleCycle(stats);
         } catch (err) {
             const t = nowMs();
 
-            // FAILURE => update streak
             if (consecutiveFailures === 0) firstFailureAt = t;
             consecutiveFailures += 1;
 
@@ -421,12 +450,12 @@ async function main() {
                 err?.message || err
             );
 
-            // Send Telegram only after 5 minutes of consecutive failures
             if (!downAlertSent && streakMs >= DOWN_ALERT_AFTER_MS) {
                 downAlertSent = true;
                 await sendTelegram(
-                    `⚠️ BMS endpoint is unreachable for ${fmtMs(streakMs)} (consecutive). ` +
-                    `Tried ports: ${portsTried}. Will keep retrying every ${Math.round(POLL_INTERVAL_MS / 1000)}s.`
+                    `⚠️ <b>BMS endpoint unreachable</b> for <b>${fmtMs(streakMs)}</b> (consecutive).\n` +
+                    `Tried ports: <code>${esc(portsTried)}</code>\n` +
+                    `Retry: every <b>${Math.round(POLL_INTERVAL_MS / 1000)}s</b>.`
                 );
                 log("error", `Down alert sent after streak=${fmtMs(streakMs)}.`);
             }
