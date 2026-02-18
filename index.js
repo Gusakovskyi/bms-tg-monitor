@@ -19,6 +19,8 @@ require("dotenv").config();
 
 const HOST = process.env.BMS_HOST || "178.212.196.134";
 const PATH = process.env.BMS_PATH || "/bsync";
+const BMS_USER = process.env.BMS_USER;
+const BMS_PASS = process.env.BMS_PASS;
 
 const DEFAULT_PORT = Number(process.env.BMS_PORT || 1020);
 const FALLBACK_PORTS = (process.env.BMS_FALLBACK_PORTS || "1010,1030,1040")
@@ -303,12 +305,19 @@ function makeMultipartBody(fields) {
 async function tryFetchStatsOnPort(port) {
     const url = buildUrl(port);
     const mp = makeMultipartBody({ r00: "99" });
+    const authHeader =
+        BMS_USER && BMS_PASS
+            ? "Basic " + Buffer.from(`${BMS_USER}:${BMS_PASS}`).toString("base64")
+            : null;
 
     const res = await fetchWithTimeout(
         url,
         {
             method: "POST",
-            headers: { "Content-Type": mp.contentType },
+            headers: {
+                "Content-Type": mp.contentType,
+                ...(authHeader ? { Authorization: authHeader } : {})
+            },
             body: mp.body,
         },
         REQUEST_TIMEOUT_MS
