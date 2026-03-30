@@ -373,14 +373,29 @@ function isAllowedTelegramMessage(message) {
 }
 
 function messageMentionsBot(message) {
-    if (!telegramBotUsername || typeof message?.text !== "string") return false;
-    const entities = Array.isArray(message.entities) ? message.entities : [];
+    if (!telegramBotUsername) return false;
 
-    return entities.some((entity) => {
-        if (entity?.type !== "mention") return false;
-        const mention = message.text.slice(entity.offset, entity.offset + entity.length);
-        return normalizeTelegramUsername(mention) === telegramBotUsername;
+    const text = typeof message?.text === "string" ? message.text : "";
+    const entities = Array.isArray(message?.entities) ? message.entities : [];
+
+    const byEntity = entities.some((entity) => {
+        if (entity?.type === "mention") {
+            const mention = text.slice(entity.offset, entity.offset + entity.length);
+            return normalizeTelegramUsername(mention) === telegramBotUsername;
+        }
+
+        if (entity?.type === "text_mention") {
+            return telegramBotUserId !== null && entity.user?.id === telegramBotUserId;
+        }
+
+        return false;
     });
+
+    if (byEntity) return true;
+
+    // Fallback for clients/updates where mention entities are missing.
+    const escaped = telegramBotUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`@${escaped}(?!\\w)`, "i").test(text);
 }
 
 function stripOwnMentions(text) {
@@ -396,7 +411,9 @@ function isMentionStatusRequest(message) {
     if (cleaned === "") return true;
 
     const normalized = cleaned.toLowerCase().trim();
-    return normalized === "status" || normalized === "статус";
+    return normalized === "status" ||
+        normalized === "/status" ||
+        normalized === "статус";
 }
 
 function isReplyStatusRequest(message) {
@@ -409,6 +426,50 @@ function shouldHandleStatusRequest(message) {
     return isStatusCommand(message?.text) ||
         isMentionStatusRequest(message) ||
         isReplyStatusRequest(message);
+}
+
+function normalizeLogText(value, maxLen = 240) {
+    if (typeof value !== "string") return null;
+    const compact = value.replace(/\s+/g, " ").trim();
+    if (compact === "") return null;
+    return compact.length > maxLen ? `${compact.slice(0, maxLen)}...` : compact;
+}
+
+function detectTelegramMessageKind(message) {
+    if (typeof message?.text === "string") return "text";
+    if (typeof message?.caption === "string") return "caption";
+    if (message?.photo) return "photo";
+    if (message?.sticker) return "sticker";
+    if (message?.document) return "document";
+    if (message?.voice) return "voice";
+    if (message?.video) return "video";
+    return "other";
+}
+
+function logIncomingTelegramUpdate(update) {
+    const message = update?.message;
+    if (!message) {
+        log("info", "Telegram incoming update without message:", {
+            updateId: update?.update_id ?? null,
+        });
+        return;
+    }
+
+    const textPreview = normalizeLogText(message.text ?? message.caption);
+    const fromDisplay = message.from?.username
+        ? `@${message.from.username}`
+        : message.from?.id ?? null;
+
+    log("info", "Telegram incoming message:", {
+        updateId: update?.update_id ?? null,
+        messageId: message.message_id ?? null,
+        chatId: message.chat?.id ?? null,
+        chatType: message.chat?.type ?? null,
+        threadId: message.message_thread_id ?? null,
+        from: fromDisplay,
+        messageKind: detectTelegramMessageKind(message),
+        text: textPreview,
+    });
 }
 
 // --- HTTP multipart POST ---
@@ -586,6 +647,7 @@ async function telegramLoop() {
 
             for (const update of updates) {
                 telegramUpdateOffset = update.update_id + 1;
+                logIncomingTelegramUpdate(update);
 
                 const message = update?.message;
                 if (!isAllowedTelegramMessage(message)) continue;
