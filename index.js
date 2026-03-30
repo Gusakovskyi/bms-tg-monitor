@@ -76,6 +76,8 @@ let firstFailureAt = null;
 let downAlertSent = false;
 let telegramUpdateOffset = null;
 let activeStatsFetch = null;
+let telegramBotUsername = null;
+let telegramBotUserId = null;
 
 function nowMs() {
     return Date.now();
@@ -95,6 +97,12 @@ function fmtMs(ms) {
     const h = Math.floor(m / 60);
     const remM = m % 60;
     return `${h}h${remM}m`;
+}
+
+function normalizeTelegramUsername(value) {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().replace(/^@+/, "").toLowerCase();
+    return normalized || null;
 }
 
 function log(level, ...args) {
@@ -354,7 +362,7 @@ async function sendTelegram(htmlText, opts = {}) {
 function isStatusCommand(text) {
     if (typeof text !== "string") return false;
     const normalized = text.trim();
-    return normalized === "?" || /^\/status(?:@\w+)?$/i.test(normalized);
+    return /^\/status(?:@\w+)?$/i.test(normalized);
 }
 
 function isAllowedTelegramMessage(message) {
@@ -362,6 +370,45 @@ function isAllowedTelegramMessage(message) {
     if (String(message.chat.id) !== String(TG_CHAT_ID)) return false;
     if (TG_THREAD_ID !== null && message.message_thread_id !== TG_THREAD_ID) return false;
     return true;
+}
+
+function messageMentionsBot(message) {
+    if (!telegramBotUsername || typeof message?.text !== "string") return false;
+    const entities = Array.isArray(message.entities) ? message.entities : [];
+
+    return entities.some((entity) => {
+        if (entity?.type !== "mention") return false;
+        const mention = message.text.slice(entity.offset, entity.offset + entity.length);
+        return normalizeTelegramUsername(mention) === telegramBotUsername;
+    });
+}
+
+function stripOwnMentions(text) {
+    if (typeof text !== "string" || !telegramBotUsername) return text?.trim?.() || "";
+    const escaped = telegramBotUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return text.replace(new RegExp(`@${escaped}`, "ig"), " ").replace(/\s+/g, " ").trim();
+}
+
+function isMentionStatusRequest(message) {
+    if (!messageMentionsBot(message)) return false;
+
+    const cleaned = stripOwnMentions(message.text).replace(/^[,\s:;-]+|[,\s:;-]+$/g, "").trim();
+    if (cleaned === "") return true;
+
+    const normalized = cleaned.toLowerCase().trim();
+    return normalized === "status" || normalized === "статус";
+}
+
+function isReplyStatusRequest(message) {
+    return telegramBotUserId !== null &&
+        message?.reply_to_message?.from?.id === telegramBotUserId &&
+        isStatusCommand(message.text);
+}
+
+function shouldHandleStatusRequest(message) {
+    return isStatusCommand(message?.text) ||
+        isMentionStatusRequest(message) ||
+        isReplyStatusRequest(message);
 }
 
 // --- HTTP multipart POST ---
@@ -486,6 +533,17 @@ async function respondWithStatus(message) {
     }
 }
 
+async function bootstrapTelegramIdentity() {
+    const me = await telegramApi("getMe", {}, 10_000);
+    telegramBotUsername = normalizeTelegramUsername(me?.username);
+    telegramBotUserId = Number.isFinite(me?.id) ? me.id : null;
+
+    log(
+        "info",
+        `Telegram bot identity: username=@${telegramBotUsername || "unknown"} id=${telegramBotUserId ?? "unknown"}`
+    );
+}
+
 async function bootstrapTelegramOffset() {
     const updates = await telegramApi(
         "getUpdates",
@@ -511,8 +569,9 @@ async function telegramLoop() {
     while (true) {
         try {
             if (telegramUpdateOffset === null) {
+                await bootstrapTelegramIdentity();
                 await bootstrapTelegramOffset();
-                log("info", "Telegram command loop started. Send '?' or /status in the configured chat.");
+                log("info", "Telegram command loop started. Use /status, mention the bot, or reply with /status.");
             }
 
             const updates = await telegramApi(
@@ -530,7 +589,7 @@ async function telegramLoop() {
 
                 const message = update?.message;
                 if (!isAllowedTelegramMessage(message)) continue;
-                if (!isStatusCommand(message.text)) continue;
+                if (!shouldHandleStatusRequest(message)) continue;
 
                 log("info", `Telegram status request received from chat=${message.chat.id} message=${message.message_id}.`);
                 await respondWithStatus(message);
