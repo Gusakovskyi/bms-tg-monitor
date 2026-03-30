@@ -17,6 +17,13 @@ require("dotenv").config();
  * - Uses HTML parse_mode + <blockquote> for metrics details (quote style).
  */
 
+function envNumber(name) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+}
+
 const HOST = process.env.BMS_HOST || "178.212.196.134";
 const PATH = process.env.BMS_PATH || "/bsync";
 const BMS_USER = process.env.BMS_USER;
@@ -31,10 +38,10 @@ const FALLBACK_PORTS = (process.env.BMS_FALLBACK_PORTS || "1010,1030,1040")
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 10_000);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 4_000);
 
-// --- MODE DETECTION (your request: 50W threshold) ---
-const ENTER_WATT = Number(process.env.ENTER_WATT || 50); // enter charge/discharge
-const EXIT_WATT = Number(process.env.EXIT_WATT || 30);   // exit to idle (hysteresis)
-const STABLE_POLLS = Number(process.env.STABLE_POLLS || 3);
+// --- MODE DETECTION ---
+const ENTER_WATT = envNumber("ENTER_WATT") ?? 50;
+const EXIT_WATT = envNumber("EXIT_WATT") ?? 30;
+const STABLE_POLLS = envNumber("STABLE_POLLS") ?? 3;
 
 // Send "unreachable" alert only after N ms of consecutive failures
 const DOWN_ALERT_AFTER_MS = Number(process.env.DOWN_ALERT_AFTER_MS || 30 * 60 * 1000);
