@@ -53,6 +53,8 @@ const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase(); // debug|info
 // --- TELEGRAM ---
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TG_THREAD_ID = envNumber("TELEGRAM_THREAD_ID");
+const TG_UPDATES_TIMEOUT_SEC = envNumber("TG_UPDATES_TIMEOUT_SEC") ?? 5;
 
 // --- runtime state ---
 let currentPort = DEFAULT_PORT;
@@ -72,6 +74,8 @@ let sessionNotified = new Set();
 let consecutiveFailures = 0;
 let firstFailureAt = null;
 let downAlertSent = false;
+let telegramUpdateOffset = null;
+let activeStatsFetch = null;
 
 function nowMs() {
     return Date.now();
@@ -218,6 +222,25 @@ function buildQuoteLines(stats) {
     ];
 }
 
+function modeLabel(currentMode) {
+    if (currentMode === "charge") return "CHARGING";
+    if (currentMode === "discharge") return "DISCHARGING";
+    if (currentMode === "idle") return "IDLE";
+    return "UNKNOWN";
+}
+
+function statusEmoji(currentMode) {
+    if (currentMode === "charge") return "⚡";
+    if (currentMode === "discharge") return "🔋";
+    return "ℹ️";
+}
+
+function resolveStatusMode(stats) {
+    const watt = toNumber(stats.Bat_Watt);
+    if (mode !== "unknown") return mode;
+    return proposeNextMode("idle", watt);
+}
+
 function msgModeStarted(currentMode, stats, level) {
     const isCharge = currentMode === "charge";
     const emoji = isCharge ? "⚡" : "🔋";
@@ -253,30 +276,92 @@ function msgLevelBoundary(dir, boundary, stats, level) {
     return `${line1}\n${line2}\n\n<blockquote>${quote}</blockquote>`;
 }
 
-async function sendTelegram(htmlText) {
+function msgStatusSnapshot(stats) {
+    const level = computeLevel(stats);
+    const currentMode = resolveStatusMode(stats);
+    const rcap = toNumber(stats.Bat_RCap);
+    const cap = toNumber(stats.Batt_Cap);
+    const quote = buildQuoteLines(stats).map(esc).join("\n");
+
+    const line1 = `${statusEmoji(currentMode)} <b>BMS STATUS</b>`;
+    const line2 = `<b>${modeLabel(currentMode)}</b> on port <b>${esc(currentPort)}</b>`;
+    const line3 =
+        level !== null && rcap !== null && cap !== null
+            ? `<b>${esc(level)}%</b> (${esc(rcap.toFixed(1))} / ${esc(cap.toFixed(1))} Ah)`
+            : `<b>Level</b>: ${esc(level ?? "?")}%`;
+
+    return `${line1}\n${line2}\n${line3}\n\n<blockquote>${quote}</blockquote>`;
+}
+
+async function telegramApi(method, body, timeoutMs = 10_000) {
+    if (!TG_TOKEN) throw new Error("Telegram bot token is not configured");
+
+    const url = `https://api.telegram.org/bot${TG_TOKEN}/${method}`;
+    const res = await fetchWithTimeout(
+        url,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        },
+        timeoutMs
+    );
+
+    if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`Telegram ${method} failed: HTTP ${res.status} ${t}`.trim());
+    }
+
+    const payload = await res.json();
+    if (!payload?.ok) {
+        throw new Error(`Telegram ${method} returned ok=false`);
+    }
+
+    return payload.result;
+}
+
+async function sendTelegram(htmlText, opts = {}) {
     if (!TG_TOKEN || !TG_CHAT_ID) {
         log("warn", "Telegram config missing. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.");
         return;
     }
 
-    const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
     const body = {
-        chat_id: TG_CHAT_ID,
+        chat_id: opts.chatId ?? TG_CHAT_ID,
         text: htmlText,
         parse_mode: "HTML",
         disable_web_page_preview: true,
+        ...(opts.messageThreadId !== undefined
+            ? { message_thread_id: opts.messageThreadId }
+            : TG_THREAD_ID !== null
+                ? { message_thread_id: TG_THREAD_ID }
+                : {}),
+        ...(opts.replyToMessageId !== undefined
+            ? {
+                reply_to_message_id: opts.replyToMessageId,
+                allow_sending_without_reply: true,
+            }
+            : {}),
     };
 
-    const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        log("error", "Telegram send failed:", res.status, t);
+    try {
+        await telegramApi("sendMessage", body);
+    } catch (err) {
+        log("error", "Telegram send failed:", err?.message || err);
     }
+}
+
+function isStatusCommand(text) {
+    if (typeof text !== "string") return false;
+    const normalized = text.trim();
+    return normalized === "?" || /^\/status(?:@\w+)?$/i.test(normalized);
+}
+
+function isAllowedTelegramMessage(message) {
+    if (!message?.chat) return false;
+    if (String(message.chat.id) !== String(TG_CHAT_ID)) return false;
+    if (TG_THREAD_ID !== null && message.message_thread_id !== TG_THREAD_ID) return false;
+    return true;
 }
 
 // --- HTTP multipart POST ---
@@ -359,6 +444,104 @@ async function fetchStatsWithPortFailover() {
     throw lastErr || new Error("All ports failed");
 }
 
+async function fetchStatsShared() {
+    if (!activeStatsFetch) {
+        activeStatsFetch = (async () => {
+            try {
+                return await fetchStatsWithPortFailover();
+            } finally {
+                activeStatsFetch = null;
+            }
+        })();
+    }
+
+    return await activeStatsFetch;
+}
+
+function triedPortsList() {
+    return [currentPort, ...FALLBACK_PORTS]
+        .filter((v, i, a) => a.indexOf(v) === i)
+        .join(",");
+}
+
+async function respondWithStatus(message) {
+    try {
+        const stats = await fetchStatsShared();
+        await sendTelegram(msgStatusSnapshot(stats), {
+            chatId: message.chat.id,
+            messageThreadId: message.message_thread_id,
+            replyToMessageId: message.message_id,
+        });
+    } catch (err) {
+        await sendTelegram(
+            `⚠️ <b>Status check failed.</b>\n` +
+            `Tried ports: <code>${esc(triedPortsList())}</code>\n` +
+            `Error: <code>${esc(err?.message || err)}</code>`,
+            {
+                chatId: message.chat.id,
+                messageThreadId: message.message_thread_id,
+                replyToMessageId: message.message_id,
+            }
+        );
+    }
+}
+
+async function bootstrapTelegramOffset() {
+    const updates = await telegramApi(
+        "getUpdates",
+        { timeout: 0, allowed_updates: ["message"] },
+        10_000
+    );
+
+    telegramUpdateOffset = updates.length > 0
+        ? updates[updates.length - 1].update_id + 1
+        : 0;
+
+    if (updates.length > 0) {
+        log("info", `Skipping ${updates.length} pending Telegram update(s) on startup.`);
+    }
+}
+
+async function telegramLoop() {
+    if (!TG_TOKEN || !TG_CHAT_ID) {
+        log("warn", "Telegram command loop disabled: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.");
+        return;
+    }
+
+    while (true) {
+        try {
+            if (telegramUpdateOffset === null) {
+                await bootstrapTelegramOffset();
+                log("info", "Telegram command loop started. Send '?' or /status in the configured chat.");
+            }
+
+            const updates = await telegramApi(
+                "getUpdates",
+                {
+                    offset: telegramUpdateOffset ?? undefined,
+                    timeout: TG_UPDATES_TIMEOUT_SEC,
+                    allowed_updates: ["message"],
+                },
+                (TG_UPDATES_TIMEOUT_SEC + 5) * 1000
+            );
+
+            for (const update of updates) {
+                telegramUpdateOffset = update.update_id + 1;
+
+                const message = update?.message;
+                if (!isAllowedTelegramMessage(message)) continue;
+                if (!isStatusCommand(message.text)) continue;
+
+                log("info", `Telegram status request received from chat=${message.chat.id} message=${message.message_id}.`);
+                await respondWithStatus(message);
+            }
+        } catch (err) {
+            log("warn", "Telegram command loop error:", err?.message || err);
+            await sleep(5_000);
+        }
+    }
+}
+
 async function handleCycle(stats) {
     const level = computeLevel(stats);
     const watt = toNumber(stats.Bat_Watt);
@@ -412,7 +595,7 @@ async function handleCycle(stats) {
     lastLevel = level;
 }
 
-async function main() {
+async function monitorLoop() {
     log("info", "Starting BMS monitor...");
     log("info", {
         HOST,
@@ -427,14 +610,13 @@ async function main() {
         DOWN_ALERT_AFTER_MS,
         LOG_LEVEL,
         LOG_EVERY_POLL,
+        TG_THREAD_ID,
+        TG_UPDATES_TIMEOUT_SEC,
     });
-
-    process.on("unhandledRejection", (err) => log("error", "unhandledRejection:", err));
-    process.on("uncaughtException", (err) => log("error", "uncaughtException:", err));
 
     while (true) {
         try {
-            const stats = await fetchStatsWithPortFailover();
+            const stats = await fetchStatsShared();
 
             // SUCCESS => reset failure streak
             if (consecutiveFailures > 0) {
@@ -456,9 +638,7 @@ async function main() {
             consecutiveFailures += 1;
 
             const streakMs = t - firstFailureAt;
-            const portsTried = [currentPort, ...FALLBACK_PORTS]
-                .filter((v, i, a) => a.indexOf(v) === i)
-                .join(",");
+            const portsTried = triedPortsList();
 
             log(
                 "warn",
@@ -479,6 +659,16 @@ async function main() {
 
         await sleep(POLL_INTERVAL_MS);
     }
+}
+
+async function main() {
+    process.on("unhandledRejection", (err) => log("error", "unhandledRejection:", err));
+    process.on("uncaughtException", (err) => log("error", "uncaughtException:", err));
+
+    await Promise.all([
+        monitorLoop(),
+        telegramLoop(),
+    ]);
 }
 
 main();
